@@ -1,10 +1,128 @@
+//! Block metadata for the bump allocator.
+//!
+//! Each allocation in the bump allocator is preceded by a `Block` header
+//! that stores metadata about the allocation.
+
+/// Metadata header for a single memory allocation.
+///
+/// This struct is placed immediately before the user-accessible data region
+/// in memory. It forms part of a singly-linked list that tracks all allocations.
+///
+/// # Memory Layout
+///
+/// ```text
+///   On a 64-bit system (typical sizes):
+///
+///   Block struct layout:
+///   ┌─────────────────────────────────────────────────────┐
+///   │  Offset   │   Field   │   Size   │    Description   │
+///   ├───────────┼───────────┼──────────┼──────────────────┤
+///   │   0x00    │   size    │  8 bytes │  Allocation size │
+///   ├───────────┼───────────┼──────────┼──────────────────┤
+///   │   0x08    │  is_free  │  1 byte  │  Free flag       │
+///   │           │ (padding) │  7 bytes │  (alignment)     │
+///   ├───────────┼───────────┼──────────┼──────────────────┤
+///   │   0x10    │   next    │  8 bytes │  Next block ptr  │
+///   └───────────┴───────────┴──────────┴──────────────────┘
+///
+///   Total size: 24 bytes (with padding for alignment)
+///
+///   In-memory representation:
+///   ┌──────────┬──────────┬───────────────────┬──────────────┐
+///   │   size   │ is_free  │     (padding)     │     next     │
+///   │  8 bytes │  1 byte  │      7 bytes      │    8 bytes   │
+///   └──────────┴──────────┴───────────────────┴──────────────┘
+///    0x00       0x08       0x09                0x10      0x18
+/// ```
+///
+/// # Relationship to User Data
+///
+/// ```text
+///   ┌────────────────────────┬─────────────────────────────────────┐
+///   │      Block Header      │            User Data                │
+///   │                        │                                     │
+///   │  ┌─────────────────┐   │   ┌─────────────────────────────┐   │
+///   │  │ size: N         │   │   │                             │   │
+///   │  │ is_free: false  │   │   │      N bytes of data        │   │
+///   │  │ next: ...       │   │   │      (user accessible)      │   │
+///   │  └─────────────────┘   │   └─────────────────────────────┘   │
+///   │                        │                                     │
+///   └────────────────────────┴─────────────────────────────────────┘
+///                            ▲
+///                            │
+///                            └── Pointer returned to user
+/// ```
+///
+/// # Linked List Structure
+///
+/// Blocks form a singly-linked list, allowing traversal of all allocations:
+///
+/// ```text
+///   Block 1              Block 2              Block 3
+///   ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+///   │ size: 64     │     │ size: 128    │     │ size: 32     │
+///   │ is_free: no  │     │ is_free: yes │     │ is_free: no  │
+///   │ next: ───────┼────►│ next: ───────┼────►│ next: null   │
+///   └──────────────┘     └──────────────┘     └──────────────┘
+///   │   64 bytes   │     │  128 bytes   │     │   32 bytes   │
+///   │  user data   │     │  user data   │     │  user data   │
+///   └──────────────┘     └──────────────┘     └──────────────┘
+/// ```
+///
+/// # Fields
+///
+/// * `size` - The size of the user data region in bytes (not including the header)
+/// * `is_free` - Whether this block has been deallocated and is available for reuse
+/// * `next` - Pointer to the next block in the linked list, or null if this is the last block
+#[repr(C)]
 pub struct Block {
+  /// Size of the user data region in bytes.
+  ///
+  /// This is the size requested by the user, not the total allocation size.
+  /// The total memory used is approximately `size_of::<Block>() + size`.
   pub size: usize,
+
+  /// Flag indicating whether this block is free (deallocated).
+  ///
+  /// - `false`: Block is in use, user data is valid
+  /// - `true`: Block has been freed, may be reused
+  ///
+  /// Note: In the current implementation, freed blocks are only truly
+  /// released back to the OS if they are the last block in the list.
   pub is_free: bool,
+
+  /// Pointer to the next block in the allocation list.
+  ///
+  /// - `null`: This is the last block (tail of the list)
+  /// - Non-null: Points to the next block's header
+  ///
+  /// This forms a singly-linked list for O(n) traversal of all allocations.
   pub next: *mut Block,
 }
 
 impl Block {
+  /// Creates a new `Block` with the specified parameters.
+  ///
+  /// # Arguments
+  ///
+  /// * `size` - Size of the user data region
+  /// * `is_free` - Initial free status
+  /// * `next` - Pointer to the next block (or null)
+  ///
+  /// # Returns
+  ///
+  /// A new `Block` instance.
+  ///
+  /// # Example
+  ///
+  /// ```rust,ignore
+  /// use std::ptr;
+  ///
+  /// let block = Block::new(64, false, ptr::null_mut());
+  /// assert_eq!(block.size, 64);
+  /// assert_eq!(block.is_free, false);
+  /// assert!(block.next.is_null());
+  /// ```
   pub fn new(
     size: usize,
     is_free: bool,
