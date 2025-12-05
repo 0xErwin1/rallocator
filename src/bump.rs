@@ -253,6 +253,96 @@ use libc::{c_void, intptr_t, sbrk};
 
 use crate::{align, align_to, block::Block};
 
+/// Strategy for searching free blocks in the allocator.
+///
+/// When reusing freed memory blocks, different search strategies offer
+/// different trade-offs between allocation speed and memory utilization.
+///
+/// # Strategies
+///
+/// ```text
+///   FREE BLOCK SEARCH STRATEGIES
+///   ═══════════════════════════════════════════════════════════════════════
+///
+///   Given blocks: [A:64] → [B:128,free] → [C:32,free] → [D:256,free] → [E:100]
+///   Request: 50 bytes
+///
+///   FIRST FIT: Start from beginning, return first match
+///   ┌──────────────────────────────────────────────────────────────────────┐
+///   │  [A:64] → [B:128,free] → [C:32,free] → [D:256,free] → [E:100]       │
+///   │     ↓           ↓                                                    │
+///   │   skip     ✓ MATCH! (128 >= 50)                                      │
+///   │  (in use)                                                            │
+///   │                                                                      │
+///   │  Returns: B (first free block that fits)                             │
+///   │  Pros: Fast - O(n) worst case, often much faster                     │
+///   │  Cons: Can cause fragmentation at the start of the heap              │
+///   └──────────────────────────────────────────────────────────────────────┘
+///
+///   NEXT FIT: Start from last allocation position, wrap around if needed
+///   ┌──────────────────────────────────────────────────────────────────────┐
+///   │  Last allocation was at C, so search starts after C:                 │
+///   │                                                                      │
+///   │  [A:64] → [B:128,free] → [C:32,free] → [D:256,free] → [E:100]       │
+///   │                               │             ↓                        │
+///   │                          last_search   ✓ MATCH! (256 >= 50)          │
+///   │                                                                      │
+///   │  Returns: D (first free block after last_search that fits)           │
+///   │  Pros: Spreads allocations, avoids always fragmenting start          │
+///   │  Cons: May miss better-fitting blocks earlier in list                │
+///   └──────────────────────────────────────────────────────────────────────┘
+///
+///   BEST FIT: Search entire list, return smallest adequate block
+///   ┌──────────────────────────────────────────────────────────────────────┐
+///   │  [A:64] → [B:128,free] → [C:32,free] → [D:256,free] → [E:100]       │
+///   │              ↓               ↓             ↓                         │
+///   │          128 >= 50       32 < 50       256 >= 50                     │
+///   │          candidate      too small      candidate                     │
+///   │              ↓                             ↓                         │
+///   │          128 bytes                     256 bytes                     │
+///   │              ↓                                                       │
+///   │          ✓ BEST! (128 < 256, smallest that fits)                     │
+///   │                                                                      │
+///   │  Returns: B (smallest free block that fits)                          │
+///   │  Pros: Minimizes wasted space within blocks                          │
+///   │  Cons: Slower - always O(n), must check all blocks                   │
+///   └──────────────────────────────────────────────────────────────────────┘
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchMode {
+  /// First Fit: Returns the first free block large enough.
+  ///
+  /// Starts searching from the beginning of the block list and returns
+  /// the first block that is both free and has sufficient size.
+  ///
+  /// - **Time Complexity**: O(n) worst case, but often faster
+  /// - **Memory Efficiency**: Can cause fragmentation at heap start
+  /// - **Best For**: General-purpose use, when speed is priority
+  #[default]
+  FirstFit,
+
+  /// Next Fit: Like First Fit, but remembers where the last search ended.
+  ///
+  /// Starts searching from where the previous successful search ended,
+  /// wrapping around to the beginning if necessary. This distributes
+  /// allocations more evenly across the heap.
+  ///
+  /// - **Time Complexity**: O(n) worst case
+  /// - **Memory Efficiency**: Better distribution, less clustering
+  /// - **Best For**: Long-running programs with many alloc/free cycles
+  NextFit,
+
+  /// Best Fit: Returns the smallest free block that fits.
+  ///
+  /// Searches the entire list to find the free block that most closely
+  /// matches the requested size, minimizing internal fragmentation.
+  ///
+  /// - **Time Complexity**: Always O(n) - must check all blocks
+  /// - **Memory Efficiency**: Minimizes wasted space per allocation
+  /// - **Best For**: Memory-constrained environments
+  BestFit,
+}
+
 /// Debug helper function that prints allocation information.
 ///
 /// Outputs the allocation size, the returned address, and the current
@@ -309,8 +399,10 @@ pub unsafe fn print_alloc(
 ///
 /// * `first` - Pointer to the first block in the allocation list (head)
 /// * `last` - Pointer to the last block in the allocation list (tail)
+/// * `search_mode` - Strategy for finding free blocks (FirstFit, NextFit, BestFit)
+/// * `last_search` - Used by NextFit to remember where the last search ended
 ///
-/// Both pointers are `null` when the allocator is empty.
+/// Both `first` and `last` pointers are `null` when the allocator is empty.
 ///
 /// # Thread Safety
 ///
@@ -325,10 +417,19 @@ pub struct BumpAllocator {
   /// New allocations are appended here. Deallocation of this
   /// block allows heap shrinking via `sbrk(-size)`.
   last: *mut Block,
+
+  /// Strategy used to search for free blocks when reusing memory.
+  /// See [`SearchMode`] for available strategies.
+  search_mode: SearchMode,
+
+  /// Pointer to the block where the last successful search ended.
+  /// Used exclusively by [`SearchMode::NextFit`] to remember the
+  /// starting position for the next search.
+  last_search: *mut Block,
 }
 
 impl BumpAllocator {
-  /// Creates a new, empty `BumpAllocator`.
+  /// Creates a new, empty `BumpAllocator` with the default search mode (FirstFit).
   ///
   /// # Returns
   ///
@@ -341,30 +442,121 @@ impl BumpAllocator {
   /// let allocator = BumpAllocator::new();
   /// // allocator.first == null
   /// // allocator.last == null
+  /// // allocator.search_mode == SearchMode::FirstFit
   /// ```
   ///
   /// # State Diagram
   ///
   /// ```text
   ///   After new():
-  ///   ┌─────────────────┐
-  ///   │  BumpAllocator  │
-  ///   │                 │
-  ///   │  first: null    │
-  ///   │  last:  null    │
-  ///   └─────────────────┘
+  ///   ┌───────────────────────────┐
+  ///   │      BumpAllocator        │
+  ///   │                           │
+  ///   │  first: null              │
+  ///   │  last:  null              │
+  ///   │  search_mode: FirstFit    │
+  ///   │  last_search: null        │
+  ///   └───────────────────────────┘
   /// ```
   pub fn new() -> Self {
     Self {
       first: ptr::null_mut(),
       last: ptr::null_mut(),
+      search_mode: SearchMode::default(),
+      last_search: ptr::null_mut(),
+    }
+  }
+
+  /// Creates a new, empty `BumpAllocator` with the specified search mode.
+  ///
+  /// # Arguments
+  ///
+  /// * `search_mode` - The strategy to use when searching for free blocks.
+  ///   See [`SearchMode`] for available options.
+  ///
+  /// # Returns
+  ///
+  /// A new allocator instance configured with the specified search mode.
+  ///
+  /// # Example
+  ///
+  /// ```rust,ignore
+  /// use rallocator::{BumpAllocator, SearchMode};
+  ///
+  /// // Create allocator with Best Fit strategy
+  /// let allocator = BumpAllocator::with_search_mode(SearchMode::BestFit);
+  ///
+  /// // Create allocator with Next Fit strategy
+  /// let allocator = BumpAllocator::with_search_mode(SearchMode::NextFit);
+  /// ```
+  ///
+  /// # Search Mode Comparison
+  ///
+  /// ```text
+  ///   ┌─────────────┬───────────────────────────────────────────────────────┐
+  ///   │   Mode      │   Description                                         │
+  ///   ├─────────────┼───────────────────────────────────────────────────────┤
+  ///   │ FirstFit    │ Fast, returns first adequate block                    │
+  ///   │ NextFit     │ Balanced, distributes allocations evenly              │
+  ///   │ BestFit     │ Memory-efficient, minimizes wasted space              │
+  ///   └─────────────┴───────────────────────────────────────────────────────┘
+  /// ```
+  pub fn with_search_mode(search_mode: SearchMode) -> Self {
+    Self {
+      first: ptr::null_mut(),
+      last: ptr::null_mut(),
+      search_mode,
+      last_search: ptr::null_mut(),
+    }
+  }
+
+  /// Returns the current search mode of the allocator.
+  ///
+  /// # Example
+  ///
+  /// ```rust,ignore
+  /// use rallocator::{BumpAllocator, SearchMode};
+  ///
+  /// let allocator = BumpAllocator::with_search_mode(SearchMode::BestFit);
+  /// assert_eq!(allocator.search_mode(), SearchMode::BestFit);
+  /// ```
+  pub fn search_mode(&self) -> SearchMode {
+    self.search_mode
+  }
+
+  /// Sets the search mode for the allocator.
+  ///
+  /// This can be changed at any time and will affect subsequent allocations.
+  /// Note: Changing to [`SearchMode::NextFit`] resets the `last_search` pointer
+  /// to the beginning of the list.
+  ///
+  /// # Arguments
+  ///
+  /// * `mode` - The new search mode to use.
+  ///
+  /// # Example
+  ///
+  /// ```rust,ignore
+  /// use rallocator::{BumpAllocator, SearchMode};
+  ///
+  /// let mut allocator = BumpAllocator::new(); // Default: FirstFit
+  /// allocator.set_search_mode(SearchMode::BestFit);
+  /// ```
+  pub fn set_search_mode(&mut self, mode: SearchMode) {
+    self.search_mode = mode;
+    // Reset last_search when changing modes to avoid stale pointers
+    if mode != SearchMode::NextFit {
+      self.last_search = ptr::null_mut();
     }
   }
 
   /// Searches the block list for a free block of sufficient size.
   ///
-  /// This method implements a **first-fit** allocation strategy,
-  /// returning the first block that is both free and large enough.
+  /// This method uses the configured [`SearchMode`] to find a suitable block:
+  ///
+  /// - [`SearchMode::FirstFit`]: Returns the first free block that fits
+  /// - [`SearchMode::NextFit`]: Starts from last allocation, wraps around
+  /// - [`SearchMode::BestFit`]: Returns the smallest block that fits
   ///
   /// # Arguments
   ///
@@ -384,11 +576,10 @@ impl BumpAllocator {
   ///   │ size: 64   │───►│ size: 128  │───►│ size: 200  │───►│ size: 50   │
   ///   │ free: no   │    │ free: yes  │    │ free: yes  │    │ free: yes  │
   ///   └────────────┘    └────────────┘    └────────────┘    └────────────┘
-  ///        ↓                  ↓
-  ///      skip             ✓ MATCH!
-  ///   (not free)        (free && 128 >= 100)
   ///
-  ///   Returns: pointer to Block 2
+  ///   FirstFit: Returns Block 2 (128 >= 100, first match)
+  ///   BestFit:  Returns Block 2 (128 is closest to 100)
+  ///   NextFit:  Depends on last_search position
   /// ```
   ///
   /// # Note
@@ -402,6 +593,28 @@ impl BumpAllocator {
   /// The caller must ensure that the allocator's internal state is valid
   /// and that no other thread is modifying the block list concurrently.
   unsafe fn find_free_block(
+    &mut self,
+    size: usize,
+  ) -> *mut Block {
+    // SAFETY: All called functions are unsafe but maintain the same invariants
+    // as this function - they require valid internal state and no concurrent access.
+    unsafe {
+      match self.search_mode {
+        SearchMode::FirstFit => self.find_free_block_first_fit(size),
+        SearchMode::NextFit => self.find_free_block_next_fit(size),
+        SearchMode::BestFit => self.find_free_block_best_fit(size),
+      }
+    }
+  }
+
+  /// First Fit: Returns the first free block that is large enough.
+  ///
+  /// Searches from the beginning of the block list.
+  ///
+  /// # Time Complexity
+  ///
+  /// O(n) worst case, but typically faster as it stops at the first match.
+  unsafe fn find_free_block_first_fit(
     &self,
     size: usize,
   ) -> *mut Block {
@@ -416,6 +629,107 @@ impl BumpAllocator {
       }
 
       ptr::null_mut()
+    }
+  }
+
+  /// Next Fit: Like First Fit, but starts where the last search ended.
+  ///
+  /// This strategy distributes allocations more evenly across the heap,
+  /// reducing fragmentation that tends to cluster at the beginning.
+  ///
+  /// # Algorithm
+  ///
+  /// ```text
+  ///   1. Start from last_search (or first if null)
+  ///   2. Search forward until end of list
+  ///   3. If not found, wrap around and search from first to last_search
+  ///   4. Update last_search to the found block (or leave unchanged if not found)
+  /// ```
+  ///
+  /// # Time Complexity
+  ///
+  /// O(n) worst case - may need to traverse entire list.
+  unsafe fn find_free_block_next_fit(
+    &mut self,
+    size: usize,
+  ) -> *mut Block {
+    unsafe {
+      // Start from last_search position, or from the beginning if null
+      let start = if self.last_search.is_null() {
+        self.first
+      } else {
+        self.last_search
+      };
+
+      // First pass: search from start to end
+      let mut current = start;
+      while !current.is_null() {
+        if (*current).is_free && (*current).size >= size {
+          self.last_search = current;
+          return current;
+        }
+        current = (*current).next;
+      }
+
+      // Second pass: wrap around, search from first to start
+      current = self.first;
+      while !current.is_null() && current != start {
+        if (*current).is_free && (*current).size >= size {
+          self.last_search = current;
+          return current;
+        }
+        current = (*current).next;
+      }
+
+      ptr::null_mut()
+    }
+  }
+
+  /// Best Fit: Returns the smallest free block that is large enough.
+  ///
+  /// Searches the entire list to find the block that minimizes wasted space.
+  ///
+  /// # Algorithm
+  ///
+  /// ```text
+  ///   Example: Looking for 100 bytes
+  ///
+  ///   [128,free] → [256,free] → [110,free] → [64,free]
+  ///       ↓            ↓            ↓            ↓
+  ///   candidate    candidate    candidate    too small
+  ///    (128)        (256)        (110)
+  ///
+  ///   Best = 110 (closest to 100 without being smaller)
+  /// ```
+  ///
+  /// # Time Complexity
+  ///
+  /// Always O(n) - must check all blocks to find the best fit.
+  unsafe fn find_free_block_best_fit(
+    &self,
+    size: usize,
+  ) -> *mut Block {
+    unsafe {
+      let mut best: *mut Block = ptr::null_mut();
+      let mut best_size: usize = usize::MAX;
+      let mut current: *mut Block = self.first;
+
+      while !current.is_null() {
+        let block_size = (*current).size;
+        // Check if this block is free, large enough, and better than current best
+        if (*current).is_free && block_size >= size && block_size < best_size {
+          best = current;
+          best_size = block_size;
+
+          // Perfect fit - no need to continue searching
+          if block_size == size {
+            return best;
+          }
+        }
+        current = (*current).next;
+      }
+
+      best
     }
   }
 
@@ -920,6 +1234,249 @@ mod tests {
       for i in 0..count {
         let val = ptr.add(i).read();
         assert_eq!(val, (i as u32) ^ 0xA5A5_A5A5);
+      }
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SearchMode Tests
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  #[test]
+  fn search_mode_default_is_first_fit() {
+    let allocator = BumpAllocator::new();
+    assert_eq!(allocator.search_mode(), SearchMode::FirstFit);
+  }
+
+  #[test]
+  fn with_search_mode_sets_mode_correctly() {
+    let allocator_first = BumpAllocator::with_search_mode(SearchMode::FirstFit);
+    let allocator_next = BumpAllocator::with_search_mode(SearchMode::NextFit);
+    let allocator_best = BumpAllocator::with_search_mode(SearchMode::BestFit);
+
+    assert_eq!(allocator_first.search_mode(), SearchMode::FirstFit);
+    assert_eq!(allocator_next.search_mode(), SearchMode::NextFit);
+    assert_eq!(allocator_best.search_mode(), SearchMode::BestFit);
+  }
+
+  #[test]
+  fn set_search_mode_changes_mode() {
+    let mut allocator = BumpAllocator::new();
+    assert_eq!(allocator.search_mode(), SearchMode::FirstFit);
+
+    allocator.set_search_mode(SearchMode::BestFit);
+    assert_eq!(allocator.search_mode(), SearchMode::BestFit);
+
+    allocator.set_search_mode(SearchMode::NextFit);
+    assert_eq!(allocator.search_mode(), SearchMode::NextFit);
+
+    allocator.set_search_mode(SearchMode::FirstFit);
+    assert_eq!(allocator.search_mode(), SearchMode::FirstFit);
+  }
+
+  /// Helper to create an allocator with multiple blocks and free some of them.
+  /// Returns the allocator and the pointers to all allocated blocks.
+  ///
+  /// Creates blocks with sizes: [64, 128, 32, 256, 64] bytes
+  /// Marks blocks at indices in `free_indices` as free.
+  unsafe fn setup_allocator_with_blocks(
+    search_mode: SearchMode,
+    free_indices: &[usize],
+  ) -> (BumpAllocator, Vec<*mut u8>) {
+    unsafe {
+      let mut allocator = BumpAllocator::with_search_mode(search_mode);
+      let sizes = [64usize, 128, 32, 256, 64];
+      let mut ptrs = Vec::new();
+
+      // Allocate all blocks
+      for &size in &sizes {
+        let layout = Layout::from_size_align(size, 8).unwrap();
+        let ptr = allocator.allocate(layout);
+        assert!(!ptr.is_null());
+        ptrs.push(ptr);
+      }
+
+      // Mark specified blocks as free
+      for &idx in free_indices {
+        let block = allocator.find_block(ptrs[idx]);
+        (*block).is_free = true;
+      }
+
+      (allocator, ptrs)
+    }
+  }
+
+  #[test]
+  fn first_fit_returns_first_matching_block() {
+    unsafe {
+      // Setup: blocks [64, 128, 32, 256, 64], free indices [1, 3] (sizes 128 and 256)
+      let (mut allocator, ptrs) = setup_allocator_with_blocks(SearchMode::FirstFit, &[1, 3]);
+
+      // Looking for 100 bytes: should return block 1 (128 bytes) - first free that fits
+      let found = allocator.find_free_block(100);
+      assert!(!found.is_null());
+
+      // The found block should be the one at index 1 (128 bytes)
+      let expected_block = allocator.find_block(ptrs[1]);
+      assert_eq!(found, expected_block);
+      assert_eq!((*found).size, 128);
+    }
+  }
+
+  #[test]
+  fn first_fit_returns_null_when_no_block_fits() {
+    unsafe {
+      // Setup: blocks [64, 128, 32, 256, 64], free indices [0, 2] (sizes 64 and 32)
+      let (mut allocator, _ptrs) = setup_allocator_with_blocks(SearchMode::FirstFit, &[0, 2]);
+
+      // Looking for 100 bytes: no free block is large enough
+      let found = allocator.find_free_block(100);
+      assert!(found.is_null());
+    }
+  }
+
+  #[test]
+  fn best_fit_returns_smallest_adequate_block() {
+    unsafe {
+      // Setup: blocks [64, 128, 32, 256, 64], free indices [1, 3] (sizes 128 and 256)
+      let (mut allocator, ptrs) = setup_allocator_with_blocks(SearchMode::BestFit, &[1, 3]);
+
+      // Looking for 100 bytes: should return block 1 (128 bytes) - smallest that fits
+      let found = allocator.find_free_block(100);
+      assert!(!found.is_null());
+
+      let expected_block = allocator.find_block(ptrs[1]);
+      assert_eq!(found, expected_block);
+      assert_eq!((*found).size, 128);
+    }
+  }
+
+  #[test]
+  fn best_fit_chooses_smaller_block_over_earlier_larger_block() {
+    unsafe {
+      // Setup: blocks [64, 128, 32, 256, 64], free indices [1, 3, 4] (sizes 128, 256, 64)
+      let (mut allocator, ptrs) = setup_allocator_with_blocks(SearchMode::BestFit, &[1, 3, 4]);
+
+      // Looking for 50 bytes: should return block 4 (64 bytes) even though block 1 (128) comes first
+      let found = allocator.find_free_block(50);
+      assert!(!found.is_null());
+
+      let expected_block = allocator.find_block(ptrs[4]);
+      assert_eq!(found, expected_block);
+      assert_eq!((*found).size, 64);
+    }
+  }
+
+  #[test]
+  fn best_fit_returns_perfect_fit_immediately() {
+    unsafe {
+      // Setup: blocks [64, 128, 32, 256, 64], free all
+      let (mut allocator, ptrs) = setup_allocator_with_blocks(SearchMode::BestFit, &[0, 1, 2, 3, 4]);
+
+      // Looking for exactly 128 bytes: should return block 1 (perfect fit)
+      let found = allocator.find_free_block(128);
+      assert!(!found.is_null());
+
+      let expected_block = allocator.find_block(ptrs[1]);
+      assert_eq!(found, expected_block);
+      assert_eq!((*found).size, 128);
+    }
+  }
+
+  #[test]
+  fn next_fit_starts_from_last_search_position() {
+    unsafe {
+      // Setup: blocks [64, 128, 32, 256, 64], free indices [0, 1, 4] (sizes 64, 128, 64)
+      let (mut allocator, ptrs) = setup_allocator_with_blocks(SearchMode::NextFit, &[0, 1, 4]);
+
+      // First search for 50 bytes: should find block 0 (64 bytes) and update last_search
+      let found1 = allocator.find_free_block(50);
+      assert!(!found1.is_null());
+      let block0 = allocator.find_block(ptrs[0]);
+      assert_eq!(found1, block0);
+
+      // Mark block 0 as used
+      (*found1).is_free = false;
+
+      // Second search for 50 bytes: should start from block 0, find block 1 (128 bytes)
+      let found2 = allocator.find_free_block(50);
+      assert!(!found2.is_null());
+      let block1 = allocator.find_block(ptrs[1]);
+      assert_eq!(found2, block1);
+
+      // Mark block 1 as used
+      (*found2).is_free = false;
+
+      // Third search for 50 bytes: should continue from block 1, find block 4 (64 bytes)
+      let found3 = allocator.find_free_block(50);
+      assert!(!found3.is_null());
+      let block4 = allocator.find_block(ptrs[4]);
+      assert_eq!(found3, block4);
+    }
+  }
+
+  #[test]
+  fn next_fit_wraps_around_to_beginning() {
+    unsafe {
+      // Setup: blocks [64, 128, 32, 256, 64], free indices [0, 4] (sizes 64, 64)
+      let (mut allocator, ptrs) = setup_allocator_with_blocks(SearchMode::NextFit, &[0, 4]);
+
+      // First search: find block 0
+      let found1 = allocator.find_free_block(50);
+      assert!(!found1.is_null());
+      (*found1).is_free = false;
+
+      // Second search: find block 4 (continues from block 0)
+      let found2 = allocator.find_free_block(50);
+      assert!(!found2.is_null());
+      let block4 = allocator.find_block(ptrs[4]);
+      assert_eq!(found2, block4);
+
+      // Free block 0 again, keep block 4 as used
+      let block0 = allocator.find_block(ptrs[0]);
+      (*block0).is_free = true;
+      (*found2).is_free = false;
+
+      // Third search: should wrap around and find block 0
+      let found3 = allocator.find_free_block(50);
+      assert!(!found3.is_null());
+      assert_eq!(found3, block0);
+    }
+  }
+
+  #[test]
+  fn next_fit_returns_null_when_no_block_fits() {
+    unsafe {
+      // Setup: blocks [64, 128, 32, 256, 64], free indices [2] (size 32 only)
+      let (mut allocator, _ptrs) = setup_allocator_with_blocks(SearchMode::NextFit, &[2]);
+
+      // Looking for 100 bytes: no free block is large enough
+      let found = allocator.find_free_block(100);
+      assert!(found.is_null());
+    }
+  }
+
+  #[test]
+  fn all_modes_return_null_on_empty_allocator() {
+    for mode in [SearchMode::FirstFit, SearchMode::NextFit, SearchMode::BestFit] {
+      let mut allocator = BumpAllocator::with_search_mode(mode);
+
+      unsafe {
+        let found = allocator.find_free_block(100);
+        assert!(found.is_null(), "Mode {:?} should return null on empty allocator", mode);
+      }
+    }
+  }
+
+  #[test]
+  fn all_modes_return_null_when_all_blocks_in_use() {
+    for mode in [SearchMode::FirstFit, SearchMode::NextFit, SearchMode::BestFit] {
+      unsafe {
+        // Setup with no free blocks
+        let (mut allocator, _ptrs) = setup_allocator_with_blocks(mode, &[]);
+
+        let found = allocator.find_free_block(32);
+        assert!(found.is_null(), "Mode {:?} should return null when no blocks are free", mode);
       }
     }
   }
