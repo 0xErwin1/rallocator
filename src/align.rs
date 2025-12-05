@@ -4,7 +4,7 @@
 ///
 /// ```rust
 /// use std::mem;
-/// use allocator::align;
+/// use rallocator::align;
 ///
 /// match mem::size_of::<usize>() {
 ///     8 => assert_eq!(align!(13), 16), // 64 bit machine.
@@ -14,9 +14,16 @@
 /// ```
 #[macro_export]
 macro_rules! align {
-  ($value:expr) => {
-    ($value + mem::size_of::<usize>() - 1) & !(mem::size_of::<usize>() - 1)
-  };
+  ($value:expr) => {{
+    // Align to machine word size
+    let word = std::mem::size_of::<usize>();
+    ($value + word - 1) & !(word - 1)
+  }};
+}
+
+#[macro_export]
+macro_rules! align_to {
+  ($value:expr, $align:expr) => {{ ($value + $align - 1) & !($align - 1) }};
 }
 
 #[cfg(test)]
@@ -24,23 +31,54 @@ mod tests {
   use std::mem;
 
   #[test]
-  fn test_align() {
-    let ptr_size = mem::size_of::<usize>();
+  fn test_align_to_word_size() {
+    let word = mem::size_of::<usize>();
 
-    let mut alignments = Vec::new();
-
-    for i in 0..10 {
-      let sizes = (ptr_size * i + 1)..=(ptr_size * (i + 1));
-
-      let expected_alignment = ptr_size * (i + 1);
-
-      alignments.push((sizes, expected_alignment));
+    for i in 1..=word {
+      assert_eq!(align_to!(i, word), word);
     }
 
-    for (sizes, expected) in alignments {
-      for size in sizes {
-        assert_eq!(expected, align!(size));
+    for k in 1..10 {
+      let start = word * k + 1;
+      let end = word * (k + 1);
+
+      for size in start..=end {
+        assert_eq!(
+          align_to!(size, word),
+          word * (k + 1),
+          "size={} should align to {}",
+          size,
+          word * (k + 1)
+        );
       }
+    }
+  }
+
+  #[test]
+  fn test_align_word_size() {
+    let word = mem::size_of::<usize>();
+
+    for i in 1..=word {
+      assert_eq!(align!(i), word);
+    }
+
+    for k in 1..10 {
+      let start = word * k + 1;
+      let end = word * (k + 1);
+
+      for size in start..=end {
+        assert_eq!(align!(size), word * (k + 1), "size={} should align to {}", size, word * (k + 1));
+      }
+    }
+  }
+
+  #[test]
+  fn test_align_exact_multiples() {
+    let word = mem::size_of::<usize>();
+
+    for k in 1..20 {
+      let val = word * k;
+      assert_eq!(align!(val), val, "Exact multiples must remain unchanged");
     }
   }
 }
